@@ -4,6 +4,7 @@ import logging
 from typing import NamedTuple, Optional, Tuple, List, Dict
 from pathlib import Path
 from argparse import ArgumentParser
+from functools import partial
 
 import numpy as np
 from astropy.coordinates import Angle, SkyCoord
@@ -11,6 +12,7 @@ from astropy import units as u
 from astropy.table import Table
 from astropy.table.row import Row
 from casacore.tables import table
+from scipy.optimize import curve_fit
 
 logger = logging.getLogger()
 ch = logging.StreamHandler()
@@ -30,6 +32,17 @@ class Catalogue(NamedTuple):
     min_col: str 
     pa_col: str 
 
+
+class CurvedPL(NamedTuple):
+    norm: float
+    alpha: float 
+    q: float
+    ref_nu: float
+
+class GaussianTaper(NamedTuple):
+    freqs: np.ndarray 
+    atten: np.ndarray 
+    offset: float
 
 KNOWN_CATAS: Dict[str, Catalogue] = {
     'SUMSS': Catalogue(
@@ -60,12 +73,7 @@ class GaussianPB:
         self.aperture = aperture
         self.expScaling = 4.*np.log(2.)
         self.frequency=frequency
-        self.setXwidth(self.getFWHM())
-        self.setYwidth(self.getFWHM())
-        self.setAlpha(0.0)
-        self.setXoff(0.0)
-        self.setYoff(0.0)
-        
+             
     
     def getFWHM(self) -> float:
         """Calculate the size of the Gaussian at the nominal frequency using the
@@ -92,41 +100,121 @@ class GaussianPB:
             self.frequency=freq
             
         pb = np.exp(-offset * offset * self.expScaling / (self.getFWHM() * self.getFWHM()))
-        return pb
     
-    def setXwidth(self,xwidth):
-        self.xwidth = xwidth
-        
-    def setYwidth(self,ywidth):
-        self.ywidth = ywidth
-        
-    def setAlpha(self,Angle):
-        self.Alpha = Angle
-        
-    def setXoff(self,xoff):
-        self.xoff = xoff
-        
-    def setYoff(self,yoff):
-        self.yoff = yoff
-        
-    def evaluateAtOffset(self,offsetPAngle=0, offsetDist=0, freq=0):
-            
-        # x-direction is assumed along the meridian in the direction of north celestial pole
-        # the offsetPA angle is relative to the meridian
-        # the Alpha angle is the rotation of the beam pattern relative to the meridian
-        # Therefore the offset relative to the
-                
-        if (freq > 0):
-            self.frequency=freq
-            
-        x_angle = offsetDist * np.cos(offsetPAngle - self.Alpha)
-        y_angle = offsetDist * np.sin(offsetPAngle - self.Alpha)
-                    
-        x_pb = np.exp(-1.0 * self.expScaling * np.power((x_angle - self.xoff) / self.xwidth, 2.0))
-        y_pb = np.exp(-1.0 * self.expScaling * np.power((y_angle - self.yoff) / self.ywidth, 2.0))
+        return pb
 
-        return x_pb * y_pb
 
+def generate_gaussian_pb(
+    freqs: u.Hz, aperture: u.m, offset: u.rad
+) -> GaussianTaper:
+    """Calculate the theoretical Gaussian taper for an aperture of 
+    known size
+
+    Args:
+        freqs (u.Hz): Frequencies to evaluate the beam at
+        aperture (u.m): Size of the dish
+        offset (u.rad): Offset from the centre of the beam
+
+    Returns:
+        GaussianTaper: Numerical results of the theoretical gaussian primary beam
+    """
+    c = 299792458.0 * u.meter / u.second
+    solid_angle = 4.*np.log(2)
+
+    offset = offset.to(u.rad)
+    freqs_hz = freqs.to(u.hertz)
+    aperture_m = aperture.to(u.meter)
+    
+    fwhms = (c / freqs_hz / aperture_m).decompose() * u.rad
+    
+    e = (-offset * offset * solid_angle / (fwhms**2)).decompose()
+    
+    taper = np.exp(
+        e
+    )
+    
+    return GaussianTaper(freqs=freqs, atten=taper, offset=offset)
+    
+    
+def _generate_p0(
+    freqs: np.ndarray, flux: np.ndarray
+) -> Tuple[float,float,float]:
+    """Creates an initial p0 set of arguments for curve_fit
+
+    Args:
+        freqs (np.ndarray): Frequencies of the data
+        flux (np.ndarray): Flux brightness
+
+    Returns:
+        Tuple[float,float,float]: Guess for the normalisation, spectral index and curvature
+    """
+    
+    p0 = (
+        np.median(flux),
+        np.log(flux[0]/flux[-1])/np.log(freqs[0]/freqs[-1]),
+        0.0
+    )
+    
+    logger.debug(f"Constructed {p0=}")
+    
+    return p0 
+
+def curved_power_law(
+    nu: np.ndarray, norm: float, alpha: float, beta: float, ref_nu: float
+) -> np.ndarray:
+    """A curved power law model.
+
+    Args:
+        nu (np.ndarray): Frequency array.
+        norm (float): Reference flux.
+        alpha (float): Spectral index.
+        beta (float): Spectral curvature.
+        ref_nu (float): Reference frequency.
+
+    Returns:
+        np.ndarray: Model flux.
+    """
+    x = nu / ref_nu
+    c = np.exp(beta*np.log(x)** 2)
+    
+    return norm * x**alpha * c
+
+
+def fit_curved_pl(
+    freqs: np.ndarray, flux: np.ndarray, ref_nu: float    
+) -> CurvedPL:
+    """Fit some specified set of datapoints with a generic
+    curved powerlaw. This is _not_ meant for real data, ratther
+    as a way of representing the functional form of a model
+    after it has been perturbed by some assumed primary beam.
+
+    Args:
+        freqs (np.ndarray): Frequencies corresponding to each brightness
+        flux (np.ndarray): Brightness corresponding to each frequency
+        ref_nu (float): Reference frequency that the model is set to
+
+    Returns:
+        CurvedPL: The fitted parameter results
+    """
+    
+    p0 = _generate_p0(
+        freqs=freqs, flux=flux
+    )
+
+    curve_pl = partial(curved_power_law, ref_nu=ref_nu)
+
+    p, cov = curve_fit(
+        curve_pl,
+        freqs,
+        flux,
+        p0
+    )
+
+    params = CurvedPL(norm=p[0], alpha=p[1], q=p[2], ref_nu=ref_nu)
+    
+    return params
+
+ 
 def dir_from_ms(ms_path: Path) -> SkyCoord:
     """Extract the pointing direction from a measurement set
 
@@ -181,6 +269,8 @@ def flux_nu(S1, alpha, nu1, nu2) -> float:
 
 def get_known_catalogue(cata: str) -> Catalogue:
     """Get the parameters of a known catalogue
+
+    TODO: Replace with configuration based method to load known cata
 
     Args:
         cata (str): The lookup name of the catalogue
@@ -368,6 +458,10 @@ def main(
             src_pos = SkyCoord(row["RA"]*u.deg, row["DEC"]*u.deg)
             src_sep = src_pos.separation(direction).radian
             ra_str, dec_str = src_pos.to_string(style='hmsdms', sep=":").split()
+            
+            gauss_taper = generate_gaussian_pb(
+                freqs=freqs*u.Hz, aperture=12.0*u.m, offset=src_sep*u.rad
+            )
             
             # This is the AO Calibrate format
             dec_str = dec_str.replace(":", ".")
