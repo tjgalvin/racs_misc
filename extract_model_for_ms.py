@@ -10,7 +10,7 @@ from functools import partial
 import numpy as np
 from astropy.coordinates import Angle, SkyCoord
 from astropy import units as u
-from astropy.table import Table
+from astropy.table import Table, QTable
 from astropy.table.row import Row
 from casacore.tables import table
 from scipy.optimize import curve_fit
@@ -47,6 +47,14 @@ class GaussianTaper(NamedTuple):
     fwhms: np.ndarray # The full-width at half-maximum corresponding to freqs
     offset: float # Angular offset of the source
 
+# These columns are what we will normalise the all columns and units to
+NORM_COLS = {
+    'flux': 'Jy',
+    'maj': 'arcsecond',
+    'min': 'arcsecond',
+    'pa': 'deg'
+}
+
 KNOWN_CATAS: Dict[str, Catalogue] = {
     'SUMSS': Catalogue(
         file_name="sumsscat.Mar-11-2008_CLH.fits", freq=843e6, ra_col='RA', dec_col='Dec', name_col='Mosaic', flux_col='Sp', maj_col='dMajAxis', min_col='dMinAxis', pa_col='dPA'
@@ -60,15 +68,15 @@ KNOWN_CATAS: Dict[str, Catalogue] = {
 }
 
 def generate_gaussian_pb(
-    freqs: u.Hz, aperture: u.m, offset: u.rad
+    freqs: u.Quantity, aperture: u.Quantity, offset: u.Quantity
 ) -> GaussianTaper:
     """Calculate the theoretical Gaussian taper for an aperture of 
     known size
 
     Args:
-        freqs (u.Hz): Frequencies to evaluate the beam at
-        aperture (u.m): Size of the dish
-        offset (u.rad): Offset from the centre of the beam
+        freqs (u.Quantity): Frequencies to evaluate the beam at
+        aperture (u.Quantity): Size of the dish
+        offset (u.Quantity): Offset from the centre of the beam
 
     Returns:
         GaussianTaper: Numerical results of the theoretical gaussian primary beam
@@ -111,7 +119,7 @@ def curved_power_law(
     return norm * x**alpha * c
 
 def fit_curved_pl(
-    freqs: np.ndarray, flux: np.ndarray, ref_nu: float    
+    freqs: u.Quantity, flux: u.Quantity, ref_nu: u.Quantity    
 ) -> CurvedPL:
     """Fit some specified set of datapoints with a generic
     curved powerlaw. This is _not_ meant for real data, ratther
@@ -126,6 +134,10 @@ def fit_curved_pl(
     Returns:
         CurvedPL: The fitted parameter results
     """
+    # Strip out the Quantity stuff
+    freqs = freqs.to(u.Hz).value
+    flux = flux.to(u.Jy).value
+    ref_nu = ref_nu.to(u.Hz).value
     
     p0 = (
         np.median(flux),
@@ -147,18 +159,29 @@ def fit_curved_pl(
     return params
  
 def evaluate_src_model(
-    freqs: np.ndarray, src_row: Row, ref_nu: float
-) -> np.ndarray:
+    freqs: u.Quantity, src_row: Row, ref_nu: u.Quantity
+) -> u.Jy:
+    """Evaluate a SED of an object using its recordded
+    Normalisation, alpha and q components. 
+
+    Args:
+        freqs (u.Quantity): Frequencies to evaluate
+        src_row (Row): Source propertieis from which the parameters are extracted
+        ref_nu (u.Quantity): Reference frequency of the model parameterization
+
+    Returns:
+        u.Jy: Brightness of model evaluated across frequency
+    """
 
     fluxes = curved_power_law(
-        nu=freqs,
-        norm=src_row['flux'],
+        nu=freqs.to(u.Hz).value,
+        norm=src_row['flux'].to(u.Jy).value,
         alpha=src_row['alpha'],
         beta=src_row['q'],
-        ref_nu=ref_nu
+        ref_nu=ref_nu.to(u.Hz).value
     )
 
-    return fluxes
+    return fluxes*u.Jy
 
 def dir_from_ms(ms_path: Path) -> SkyCoord:
     """Extract the pointing direction from a measurement set
@@ -236,6 +259,8 @@ def load_catalogue(
         cata = get_known_catalogue(catalogue)
     
     else:
+        # Assertion is done to keep the linters happy
+        assert ms_pointing is not None, f"Expected SkyCoord object, received None. "
         dec_point = float(ms_pointing.dec.deg)
         logger.info(f"Automatically loading catalogue based on {dec_point=:.2f}")
         
@@ -269,7 +294,7 @@ def load_catalogue(
     return (cata, cata_tab)
 
 def preprocess_catalogue(
-    cata_info: Catalogue, cata_tab: Table, ms_pointing: SkyCoord, flux_cut: float=0.02, radial_cut: float=1.
+    cata_info: Catalogue, cata_tab: Table, ms_pointing: SkyCoord, flux_cut: float=0.02, radial_cut: u.deg=1.*u.deg
 ) -> Table:
     """Apply the flux and separation cuts to a loaded table, and transform input column names to an 
     expected set of column names. 
@@ -279,7 +304,7 @@ def preprocess_catalogue(
         cata_tab (Table): The loaded catalogue table
         ms_pointing (SkyCoord): Pointing of the measurement set
         flux_cut (float, optional): Flux cut in Jy. Defaults to 0.02.
-        radial_cut (float, optional): Radial separation cut in deg. Defaults to 1..
+        radial_cut (u.deg, optional): Radial separation cut in deg. Defaults to 1..
 
     Returns:
         Table: _description_
@@ -298,6 +323,8 @@ def preprocess_catalogue(
     logger.info(f"{np.sum(sep_mask)} common sources selected. ")
     
     cata_tab = cata_tab[mask]    
+    
+    # Rename the columns to a expected form
     cols = [
         cata_info.ra_col,
         cata_info.dec_col,
@@ -316,7 +343,11 @@ def preprocess_catalogue(
         logger.debug(f"Updating Table column {orig} to {new}.")
         new_cata_tab[orig].name = new
 
-    return new_cata_tab
+    # Put the columns into expected units
+    for key, unit_str in NORM_COLS.items():
+        new_cata_tab[key] = new_cata_tab[key].to(u.Unit(unit_str))
+
+    return QTable(new_cata_tab)
 
 def make_ds9_region(out_path: Path, sources: List[Row]) -> Path:
     """Create a DS9 region file of the sky-model derived
@@ -334,14 +365,24 @@ def make_ds9_region(out_path: Path, sources: List[Row]) -> Path:
         out_file.write("# DS9 region file\n")
         out_file.write("fk5\n")
         
+        
         for source in sources:
-            if source["maj"] < 1.0 and source["min"] < 1.0:
+            if source["maj"] < 1.0*u.arcsecond and source["min"] < 1.0*u.arcsecond:
                 out_file.write(
-                    "point(%f,%f) # point=circle color=red dash=1\n" %(source["RA"], source["DEC"])
+                    "point(%f,%f) # point=circle color=red dash=1\n"%(
+                        source["RA"].value, 
+                        source["DEC"].value
+                    )
                 )
             else:
                 out_file.write(
-                    "ellipse(%f,%f,%f,%f,%f) # color=red dash=1\n" %(source["RA"], source["DEC"], source["maj"], source["min"], 90.0+source["pa"])
+                    "ellipse(%f,%f,%f,%f,%f) # color=red dash=1\n" %(
+                        source["RA"].value, 
+                        source["DEC"].value, 
+                        source["maj"].value, 
+                        source["min"].value, 
+                        90.0+source["pa"].value
+                    )
                 )
         
     return out_path
@@ -365,13 +406,13 @@ def make_hyperdrive_model(
     for (row, cpl) in sources:
         logger.debug(row)
         
-        src_ra = float(row["RA"])
-        src_dec = float(row["DEC"])
-        comp_type = "point" if (row["maj"] < 1. and row["min"] < 1.) else {
+        src_ra = float(row["RA"].to(u.deg).value)
+        src_dec = float(row["DEC"].to(u.deg).value)
+        comp_type = "point" if (row["maj"] < 1.*u.arcsecond and row["min"] < 1.*u.arcsecond) else {
             "gaussian": {
-                "maj": float(row["maj"]),
-                "min": float(row["min"]),
-                "pa": float(row["pa"])
+                "maj": float(row["maj"].to(u.arcsecond).value),
+                "min": float(row["min"].to(u.arcsecond).value),
+                "pa": float(row["pa"].to(u.arcsecond).value)
             }
         }
         flux_type = {
@@ -419,13 +460,13 @@ def main(
     direction = dir_from_ms(ms_path)
     logger.info(f"Extracting local sky catalogue centred on {direction.ra.deg} {direction.dec.deg}.")
 
-    freqs = freqs_from_ms(ms_path)
+    freqs = freqs_from_ms(ms_path)*u.Hz
     logger.info(
         f"Frequency range: {freqs[0]/1000.:.3f} MHz - {freqs[-1]/1000.:.3f} MHz (centre = {np.mean(freqs/1000.):.3f} MHz)"
     )
     
     pb = generate_gaussian_pb(
-        freqs=freqs*u.Hz, aperture=12.*u.m, offset=0*u.rad
+        freqs=freqs, aperture=12.*u.m, offset=0*u.rad
     )
     
     radial_cutoff = (fwhm_scale_cutoff * pb.fwhms[0]).decompose() # Go out just over 2 times the half-power point.
@@ -442,22 +483,22 @@ def main(
 
     model_path = ms_path.with_suffix(".model")
 
-    total_flux = 0.0
+    total_flux: u.Jy = 0.0 * u.Jy
     accepted_rows: List[Tuple[Row,CurvedPL]] = []
 
     for i, row in enumerate(cata_tab):
-        src_pos = SkyCoord(row["RA"]*u.deg, row["DEC"]*u.deg)
+        src_pos = SkyCoord(row["RA"], row["DEC"])
         src_sep = src_pos.separation(direction)
         
         gauss_taper = generate_gaussian_pb(
-            freqs=freqs*u.Hz, aperture=12.0*u.m, offset=src_sep
+            freqs=freqs, aperture=12.0*u.m, offset=src_sep
         )
         src_model = evaluate_src_model(
-            freqs=freqs, src_row=row, ref_nu=cata_info.freq
+            freqs=freqs, src_row=row, ref_nu=cata_info.freq*u.Hz
         )
         predict_model = fit_curved_pl(
             freqs=freqs,
-            flux=src_model*gauss_taper.atten/1000.,
+            flux=src_model*gauss_taper.atten,
             ref_nu=freqs[0]
         )
                 
@@ -465,11 +506,11 @@ def main(
             continue
         
         accepted_rows.append((row,predict_model))
-        total_flux += predict_model.norm
+        total_flux += (predict_model.norm * u.Jy)
         
         logger.info(f"{len(accepted_rows):05d} Sep={src_sep.to(u.deg):.3f} S_ref={predict_model.norm:.3f} SI={predict_model.alpha:.3f} q={predict_model.q:.3f}")
 
-    logger.info(f"\nCreated model, total apparent flux = {total_flux:.4f} Jy, no. sources {len(accepted_rows)}.\n")
+    logger.info(f"\nCreated model, total apparent flux = {total_flux:.4f}, no. sources {len(accepted_rows)}.\n")
 
     hyperdrive_path = ms_path.with_suffix(".hyp.yaml")
     make_hyperdrive_model(
