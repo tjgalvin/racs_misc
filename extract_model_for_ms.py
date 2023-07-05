@@ -90,29 +90,6 @@ def generate_gaussian_pb(
     
     return GaussianTaper(freqs=freqs, atten=taper, fwhms=fwhms, offset=offset)
         
-def _generate_p0(
-    freqs: np.ndarray, flux: np.ndarray
-) -> Tuple[float,float,float]:
-    """Creates an initial p0 set of arguments for curve_fit
-
-    Args:
-        freqs (np.ndarray): Frequencies of the data
-        flux (np.ndarray): Flux brightness
-
-    Returns:
-        Tuple[float,float,float]: Guess for the normalisation, spectral index and curvature
-    """
-    
-    p0 = (
-        np.median(flux),
-        np.log(flux[0]/flux[-1])/np.log(freqs[0]/freqs[-1]),
-        0.0
-    )
-    
-    logger.debug(f"Constructed {p0=}")
-    
-    return p0 
-
 def curved_power_law(
     nu: np.ndarray, norm: float, alpha: float, beta: float, ref_nu: float
 ) -> np.ndarray:
@@ -150,8 +127,10 @@ def fit_curved_pl(
         CurvedPL: The fitted parameter results
     """
     
-    p0 = _generate_p0(
-        freqs=freqs, flux=flux
+    p0 = (
+        np.median(flux),
+        np.log(flux[0]/flux[-1])/np.log(freqs[0]/freqs[-1]),
+        0.0
     )
 
     curve_pl = partial(curved_power_law, ref_nu=ref_nu)
@@ -349,7 +328,7 @@ def make_ds9_region(out_path: Path, sources: List[Row]) -> Path:
     Returns:
         Path: Path to the region file created
     """
-    logger.info(f"Creating DS9 region file, writing to {str(out_path)}.")
+    logger.info(f"Creating DS9 region file, writing {len(sources)} regions to {str(out_path)}.")
     with open(out_path, "wt") as out_file:
         
         out_file.write("# DS9 region file\n")
@@ -380,7 +359,7 @@ def make_hyperdrive_model(
     Returns:
         Path: The path of the file created
     """
-    logger.info(f"Creating hyperdrive sky-model, writing {len(sources)} components to {out_path}")
+    logger.info(f"Creating hyperdrive sky-model, writing {len(sources)} components to {out_path}.")
     src_list = {}
     
     for (row, cpl) in sources:
