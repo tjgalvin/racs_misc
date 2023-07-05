@@ -261,6 +261,8 @@ def load_catalogue(
     catalogue_dir: Path,
     catalogue: Optional[str] = None,
     ms_pointing: Optional[SkyCoord] = None,
+    assumed_alpha: float=-0.83,
+    assumed_q: float=0.0
 ) -> Tuple[Catalogue, Table]:
     """Load in a catalogue table given a name or measurement set declinattion.
 
@@ -268,7 +270,9 @@ def load_catalogue(
         catalogue_dir (Path): Directory containing known catalogues
         catalogue (Optional[str], optional): Catalogue name to look up from known catalogues. Defaults to None.
         ms_pointing (Optional[SkyCoord], optional): Pointing direction of the measurement set. Defaults to None.
-
+        assumed_alpha (float, optional): The assumed spectral index to use if there is no spectral index column known in model catalogue. Defaults to -0.83.
+        assumed_q (float, optional): The assumed curvature to use if there is no curvature column known in model catalogue. Defaults to 0.0.
+        
     Raises:
         FileNotFoundError: Raised when a catalogue can not be resolved.
 
@@ -306,12 +310,12 @@ def load_catalogue(
 
     _cols = cata._asdict()
     if cata.alpha_col is None:
-        logger.info(f"Adding default 'alpha' column. ")
-        cata_tab["alpha"] = -0.83
+        logger.info(f"No 'alpha' column, adding default spectral index of {assumed_alpha:.3f}. ")
+        cata_tab["alpha"] = assumed_alpha
         _cols["alpha_col"] = "alpha"
     if cata.q_col is None:
-        logger.info(f"Adding default 'q' column. ")
-        cata_tab["q"] = 0
+        logger.info(f"No 'q' column, adding default {assumed_q:.3f}. ")
+        cata_tab["q"] = assumed_q
         _cols["q_col"] = "q"
 
     cata = Catalogue(**_cols)
@@ -475,7 +479,8 @@ def main(
     ms_path: Path,
     cata_dir: Path = Path("."),
     cata_name: Optional[str] = None,
-    spectral_index: float = -0.83,
+    assumed_alpha: float = -0.83,
+    assumed_q: float = 0.0,
     flux_cutoff: float = 0.02,
     fwhm_scale_cutoff: float = 1,
 ) -> Path:
@@ -485,7 +490,8 @@ def main(
         ms_path (Path): Measurement set to create sky-model for
         cata_dir (Path, optional): Directory containing known catalogues. Defaults to Path(".").
         cata_name (Optional[str], optional): Name of the catalogue. If None, select based on MS properties. Defaults to None.
-        spectral_index (float, optional): The assumed spectral index to use. Defaults to -0.83.
+        assumed_alpha (float, optional): The assumed spectral index to use if there is no spectral index column known in model catalogue. Defaults to -0.83.
+        assumed_q (float, optional): The assumed curvature to use if there is no curvature column known in model catalogue. Defaults to 0.0.
         flux_cutoff (float, optional): Sources whose *apparent* brightness (at the lowest channel of the MS) as excluded from sky-model. Defaults to 0.02.
         fwhm_scale_cutoff (float, optional): Scaling factor to stretch the analytical FWHM by when searching for sources. Defaults to 1.
 
@@ -575,7 +581,10 @@ def get_parser():
         "ms", type=Path, help="Path to the measurement set to create the sky-model for"
     )
     parser.add_argument(
-        "--assumed-alpha", type=float, default=-0.83, help="Assumed spectral index. "
+        "--assumed-alpha", type=float, default=-0.83, help="Assumed spectral index when no appropriate column in sky-catalogue. "
+    )
+    parser.add_argument(
+        "--assumed-q", type=float, default=0.0, help="Assumed curvature when no apropriate column in sky-catalogue. "
     )
     parser.add_argument(
         "--fwhm-scale",
@@ -587,7 +596,7 @@ def get_parser():
         "--flux-cutoff",
         type=float,
         default=0.02,
-        help="Apparent flux density cutoff for sources to be above to be included in the model. ",
+        help="Apparent flux density (in Jy) cutoff for sources to be above to be included in the model. ",
     )
     parser.add_argument(
         "--cata-dir",
@@ -616,6 +625,8 @@ if __name__ == "__main__":
         ms_path=args.ms,
         cata_dir=args.cata_dir,
         cata_name=args.cata_name,
+        flux_cutoff=args.flux_cutoff,
         fwhm_scale_cutoff=args.fwhm_scale,
-        spectral_index=args.assumed_alpha,
+        assumed_alpha=args.assumed_alpha,
+        assumed_q=args.assumed_q
     )
