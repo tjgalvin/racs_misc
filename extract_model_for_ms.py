@@ -234,13 +234,15 @@ def get_known_catalogue(cata: str) -> Catalogue:
 
     return cata_info
 
-def load_catalogue(catalogue_dir: Path, catalogue: Optional[str]=None, dec_point: Optional[float]=None) -> Tuple[Catalogue,Table]:
+def load_catalogue(
+    catalogue_dir: Path, catalogue: Optional[str]=None, ms_pointing: Optional[SkyCoord]=None
+) -> Tuple[Catalogue,Table]:
     """Load in a catalogue table given a name or measurement set declinattion. 
 
     Args:
         catalogue_dir (Path): Directory containing known catalogues
         catalogue (Optional[str], optional): Catalogue name to look up from known catalogues. Defaults to None.
-        dec_point (Optional[float], optional): Pointing direction of the measurement set. Defaults to None.
+        ms_pointing (Optional[SkyCoord], optional): Pointing direction of the measurement set. Defaults to None.
 
     Raises:
         FileNotFoundError: Raised when a catalogue can not be resolved. 
@@ -248,15 +250,15 @@ def load_catalogue(catalogue_dir: Path, catalogue: Optional[str]=None, dec_point
     Returns:
         Tuple[Catalogue,Table]: The `Catalogue` information and `Table` of components loaded
     """
-    assert catalogue is not None or dec_point is not None, "Either catalogue or dec_point have to be provided. "
+    assert catalogue is not None or ms_pointing is not None, "Either catalogue or dec_point have to be provided. "
     
     if catalogue:
         logger.info(f"Loading provided catalogue {catalogue=}")
         cata = get_known_catalogue(catalogue)
     
     else:
+        dec_point = float(ms_pointing.dec.deg)
         logger.info(f"Automatically loading catalogue based on {dec_point=:.2f}")
-        assert dec_point is not None, f"Invalid type of {dec_point=}"
         
         if dec_point < -75.:
             cata = get_known_catalogue('SUMSS')
@@ -378,7 +380,7 @@ def make_hyperdrive_model(
     Returns:
         Path: The path of the file created
     """
-    logger.info(f"Creating hyperdrive sky-model, writing {len(src_list)} components to {out_path}")
+    logger.info(f"Creating hyperdrive sky-model, writing {len(sources)} components to {out_path}")
     src_list = {}
     
     for (row, cpl) in sources:
@@ -453,7 +455,7 @@ def main(
     cata_info, cata_tab = load_catalogue(
         catalogue_dir=cata_dir,
         catalogue=cata_name,
-        dec_point=direction.dec.deg
+        ms_pointing=direction
     )
     cata_tab = preprocess_catalogue(
         cata_info, cata_tab, ms_pointing=direction, flux_cut=flux_cutoff, radial_cut=radial_cutoff
@@ -462,8 +464,7 @@ def main(
     model_path = ms_path.with_suffix(".model")
 
     total_flux = 0.0
-    # Will be used to generate ds9
-    accepted_rows: List[Tuple(Row,CurvedPL)] = []
+    accepted_rows: List[Tuple[Row,CurvedPL]] = []
 
     for i, row in enumerate(cata_tab):
         src_pos = SkyCoord(row["RA"]*u.deg, row["DEC"]*u.deg)
