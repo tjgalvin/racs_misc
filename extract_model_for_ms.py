@@ -347,7 +347,7 @@ def make_ds9_region(out_path: Path, sources: List[Row]) -> Path:
     Returns:
         Path: Path to the region file created
     """
-    logger.info(f"Writing DS9 region file, writing to {str(out_path)}.")
+    logger.info(f"Creating DS9 region file, writing to {str(out_path)}.")
     with open(out_path, "wt") as out_file:
         
         out_file.write("# DS9 region file\n")
@@ -372,13 +372,13 @@ def make_hyperdrive_model(
 
     Args:
         out_path (Path): The output path that the sky-model would be written to
-        srcs (List[Tuple[Row,CurvedPL]]): Collection of sources to write, including the
+        sources (List[Tuple[Row,CurvedPL]]): Collection of sources to write, including the
         normalied row and the results of fitting to the estimated apparent SED
 
     Returns:
         Path: The path of the file created
     """
-    
+    logger.info(f"Creating hyperdrive sky-model, writing {len(src_list)} components to {out_path}")
     src_list = {}
     
     for (row, cpl) in sources:
@@ -412,7 +412,6 @@ def make_hyperdrive_model(
         }]
             
     with open(out_path, "w") as out_file:
-        logger.info(f"Writing {len(src_list)} components to {out_path}.")
         yaml.dump(src_list, stream=out_file)
     
     return out_path
@@ -440,17 +439,14 @@ def main(
     logger.info(f"Extracting local sky catalogue centred on {direction.ra.deg} {direction.dec.deg}.")
 
     freqs = freqs_from_ms(ms_path)
-    freqcent = np.mean(np.unique(freqs))
-    f0 = freqs[0]
-    fN = freqs[-1]
     logger.info(
         f"Frequency range: {freqs[0]/1000.:.3f} MHz - {freqs[-1]/1000.:.3f} MHz (centre = {np.mean(freqs/1000.):.3f} MHz)"
     )
     
     pb = generate_gaussian_pb(
         freqs=freqs*u.Hz, aperture=12.*u.m, offset=0*u.rad
-    ) #, expscaling=1.09)
-
+    )
+    
     radial_cutoff = (fwhm_scale_cutoff * pb.fwhms[0]).decompose() # Go out just over 2 times the half-power point.
     logger.info("Radial cutoff = %.3f degrees" %(radial_cutoff.to(u.deg).value))
 
