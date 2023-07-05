@@ -538,12 +538,18 @@ def main(
         src_pos = SkyCoord(row["RA"], row["DEC"])
         src_sep = src_pos.separation(direction)
 
+        # Get the primary beam reasponse
         gauss_taper = generate_gaussian_pb(
             freqs=freqs, aperture=12.0 * u.m, offset=src_sep
         )
+        
+        # Calculate the expected model
         src_model = evaluate_src_model(
             freqs=freqs, src_row=row, ref_nu=cata_info.freq * u.Hz
         )
+        
+        # Estimate the apparent model (intrinsic*response), and
+        # then numerically fit to it
         predict_model = fit_curved_pl(
             freqs=freqs, flux=src_model * gauss_taper.atten, ref_nu=freqs[0]
         )
