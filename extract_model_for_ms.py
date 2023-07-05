@@ -31,6 +31,8 @@ class Catalogue(NamedTuple):
     maj_col: str 
     min_col: str 
     pa_col: str 
+    alpha_col: Optional[str] = None # Used to scale the SED
+    q_col: Optional[str] = None # Used to scale the SED
 
 
 class CurvedPL(NamedTuple):
@@ -40,9 +42,10 @@ class CurvedPL(NamedTuple):
     ref_nu: float
 
 class GaussianTaper(NamedTuple):
-    freqs: np.ndarray 
-    atten: np.ndarray 
-    offset: float
+    freqs: np.ndarray # The frequencies the beam is evaluated at 
+    atten: np.ndarray # The attenuation of the response
+    fwhms: np.ndarray # The full-width at half-maximum corresponding to freqs
+    offset: float # Angular offset of the source
 
 KNOWN_CATAS: Dict[str, Catalogue] = {
     'SUMSS': Catalogue(
@@ -133,9 +136,8 @@ def generate_gaussian_pb(
         e
     )
     
-    return GaussianTaper(freqs=freqs, atten=taper, offset=offset)
-    
-    
+    return GaussianTaper(freqs=freqs, atten=taper, fwhms=fwhms, offset=offset)
+        
 def _generate_p0(
     freqs: np.ndarray, flux: np.ndarray
 ) -> Tuple[float,float,float]:
@@ -179,7 +181,6 @@ def curved_power_law(
     
     return norm * x**alpha * c
 
-
 def fit_curved_pl(
     freqs: np.ndarray, flux: np.ndarray, ref_nu: float    
 ) -> CurvedPL:
@@ -213,8 +214,21 @@ def fit_curved_pl(
     params = CurvedPL(norm=p[0], alpha=p[1], q=p[2], ref_nu=ref_nu)
     
     return params
-
  
+def evaluate_src_model(
+    freqs: np.ndarray, src_row: Row, ref_nu: float
+) -> np.ndarray:
+
+    fluxes = curved_power_law(
+        nu=freqs,
+        norm=src_row['flux'],
+        alpha=src_row['alpha'],
+        beta=src_row['q'],
+        ref_nu=ref_nu
+    )
+
+    return fluxes
+
 def dir_from_ms(ms_path: Path) -> SkyCoord:
     """Extract the pointing direction from a measurement set
 
@@ -250,7 +264,6 @@ def freqs_from_ms(ms_path: Path) -> np.ndarray:
     tf.close()
     return freqs
 
-
 def flux_nu(S1, alpha, nu1, nu2) -> float:
     """Scale the flux S1 measured at frequency nu1 to nu2 assuming
     a spectral index of alpha
@@ -265,7 +278,6 @@ def flux_nu(S1, alpha, nu1, nu2) -> float:
         float: Brights at nu2
     """
     return S1 * np.power(nu2 / nu1, alpha)
-
 
 def get_known_catalogue(cata: str) -> Catalogue:
     """Get the parameters of a known catalogue
@@ -324,8 +336,19 @@ def load_catalogue(catalogue_dir: Path, catalogue: Optional[str]=None, dec_point
     cata_tab = Table.read(cata_path)
     logger.info(f"Loaded table, found {len(cata_tab)} sources. ")
     
+    _cols = cata._asdict()
+    if cata.alpha_col is None: 
+        logger.info(f"Adding default 'alpha' column. ")
+        cata_tab["alpha"] = -0.83
+        _cols["alpha_col"] = "alpha"
+    if cata.q_col is None:
+        logger.info(f"Adding default 'q' column. ")
+        cata_tab["q"] = 0
+        _cols["q_col"] = "q"
+    
+    cata = Catalogue(**_cols)
+    
     return (cata, cata_tab)
-
 
 def preprocess_catalogue(
     cata_info: Catalogue, cata_tab: Table, ms_pointing: SkyCoord, flux_cut: float=0.02, radial_cut: float=1.
@@ -343,6 +366,7 @@ def preprocess_catalogue(
     Returns:
         Table: _description_
     """
+    # First apply pre-processing options
     flux_mask = cata_tab[cata_info.flux_col] > flux_cut
     logger.info(f"{np.sum(flux_mask)} above {flux_cut} Jy.")
     
@@ -356,7 +380,7 @@ def preprocess_catalogue(
     mask = flux_mask & sep_mask
     logger.info(f"{np.sum(sep_mask)} common sources selected. ")
     
-    cata_tab = cata_tab[mask]
+    cata_tab = cata_tab[mask]    
     cols = [
         cata_info.ra_col,
         cata_info.dec_col,
@@ -365,15 +389,17 @@ def preprocess_catalogue(
         cata_info.maj_col,
         cata_info.min_col,
         cata_info.pa_col,
+        cata_info.alpha_col,
+        cata_info.q_col
     ]
-    out_cols = ['RA', 'DEC', 'Name', 'Flux', 'Maj', 'Min', 'PA']
-    cata_tab = cata_tab[cols]
+    out_cols = ['RA', 'DEC', 'name', 'flux', 'maj', 'min', 'pa', 'alpha', 'q']
+    new_cata_tab = cata_tab[cols]
 
     for (orig, new) in zip(cols, out_cols):
         logger.debug(f"Updating Table column {orig} to {new}.")
-        cata_tab[orig].name = new
+        new_cata_tab[orig].name = new
 
-    return cata_tab
+    return new_cata_tab
 
 def make_ds9_region(out_path: Path, sources: List[Row]) -> Path:
     """Create a DS9 region file of the sky-model derived
@@ -392,13 +418,13 @@ def make_ds9_region(out_path: Path, sources: List[Row]) -> Path:
         out_file.write("fk5\n")
         
         for source in sources:
-            if source["Maj"] < 1.0 and source["Min"] < 1.0:
+            if source["maj"] < 1.0 and source["min"] < 1.0:
                 out_file.write(
                     "point(%f,%f) # point=circle color=red dash=1\n" %(source["RA"], source["DEC"])
                 )
             else:
                 out_file.write(
-                    "ellipse(%f,%f,%f,%f,%f) # color=red dash=1\n" %(source["RA"], source["DEC"], source["Maj"], source["Min"], 90.0+source["PA"])
+                    "ellipse(%f,%f,%f,%f,%f) # color=red dash=1\n" %(source["RA"], source["DEC"], source["maj"], source["min"], 90.0+source["pa"])
                 )
         
     return out_path
@@ -462,11 +488,20 @@ def main(
             gauss_taper = generate_gaussian_pb(
                 freqs=freqs*u.Hz, aperture=12.0*u.m, offset=src_sep*u.rad
             )
+            src_model = evaluate_src_model(
+                freqs=freqs, src_row=row, ref_nu=cata_info.freq
+            )
+            
+            predict_model = fit_curved_pl(
+                freqs=freqs,
+                flux=src_model*gauss_taper.atten/1000.,
+                ref_nu=freqcent
+            )
             
             # This is the AO Calibrate format
             dec_str = dec_str.replace(":", ".")
             
-            s_cat = row["Flux"] / 1000. 
+            s_cat = row["flux"] / 1000. 
             s_nu_low_int = s_cat * np.power(f0 / cata_info.freq, spectral_index)
             s_nu_high_int = s_cat * np.power(fN / cata_info.freq, spectral_index)
             
@@ -483,16 +518,19 @@ def main(
 
             total_flux += (s_nu_low_app + s_nu_high_app) / 2.
             logger.info(
-                f"{len(accepted_rows):05d} {row['Name']} {s_cat=:.4f} S0={s_nu_low_int:.4f} {s_nu_low_app:.4f} SN={s_nu_high_int:.4f} {s_nu_high_app:.4f} {src_sep:.2f} deg Sref={s_ref:0.4f} alpha={alpha_app:.3f}"
+                f"{len(accepted_rows):05d} {row['name']} {s_cat=:.4f} S0={s_nu_low_int:.4f} {s_nu_low_app:.4f} SN={s_nu_high_int:.4f} {s_nu_high_app:.4f} {src_sep:.2f} deg Sref={s_ref:0.4f} alpha={alpha_app:.3f}"
             )
             
-            if row["Maj"] < 1.0 and row["Min"] < 1.0:
+            logger.info(
+                f"{predict_model}"
+            )
+            if row["maj"] < 1.0 and row["min"] < 1.0:
                 fout.write(
                     f"s{i:05d},POINT,{ra_str},{dec_str},{s_ref},[{alpha_app},0.0],true,{freqcent},,,\n"
                 )
             else:
                 fout.write(
-                    f"s{i:05d},GAUSS,{ra_str},{dec_str},{s_ref},[{alpha_app},0.0],true,{freqcent},{row['Maj']},{row['Min']},{row['PA']}\n"
+                    f"s{i:05d},GAUSS,{ra_str},{dec_str},{s_ref},[{alpha_app},0.0],true,{freqcent},{row['maj']},{row['min']},{row['pa']}\n"
                 )
 
     logger.info(f"Written {model_path}, total flux = {total_flux:.4f}, no. sources {len(accepted_rows)}. ")
