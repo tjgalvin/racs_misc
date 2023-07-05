@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 import logging 
+import yaml
 from typing import NamedTuple, Optional, Tuple, List, Dict
 from pathlib import Path
 from argparse import ArgumentParser
@@ -34,7 +35,6 @@ class Catalogue(NamedTuple):
     alpha_col: Optional[str] = None # Used to scale the SED
     q_col: Optional[str] = None # Used to scale the SED
 
-
 class CurvedPL(NamedTuple):
     norm: float
     alpha: float 
@@ -58,54 +58,6 @@ KNOWN_CATAS: Dict[str, Catalogue] = {
         file_name='NVSS_vizier.fits', freq=1400e6, ra_col="RAJ2000", dec_col="DEJ2000", name_col='NVSS', flux_col='S1_4', maj_col='MajAxis', min_col='MinAxis', pa_col='PA'
     )
 }
-
-class GaussianPB:
-    """A simple PB model
-    """
-    
-    def __init__(self, aperture: float = 12.0, frequency: float = 1.1e9) -> None:
-        """Set up the PB Gaussian model
-
-        Args:
-            aperture (float, optional): The size of the dish, in meters. Defaults to 12.0.
-            frequency (float, optional): The nominal observing frequency, in Herta. Defaults to 1.1e9.
-        """
-        
-        # TODO: Correct the `evaluate` method to properly calculate the FWHM internally
-        
-        self.aperture = aperture
-        self.expScaling = 4.*np.log(2.)
-        self.frequency=frequency
-             
-    
-    def getFWHM(self) -> float:
-        """Calculate the size of the Gaussian at the nominal frequency using the
-        provided aperture size.
-
-        Returns:
-            float: The FWHM in radians
-        """
-        sol = 299792458.0
-        fwhm = sol / self.frequency / self.aperture
-        return fwhm
-    
-    def evaluate(self,offset: float = 0.0, freq: float = 0.0) -> float:
-        """Calculate the attenuation at a provuded offset.
-        
-        Args:
-            offset (float, optional): Distance from the origin, in radians. Defaults to 0.0.
-            freq (float, optional): Frequency to evaluate at, in Hertz. Defaults to 0.0.
-
-        Returns:
-            float: The estimated amount of attenuation
-        """
-        if (freq > 0):
-            self.frequency=freq
-            
-        pb = np.exp(-offset * offset * self.expScaling / (self.getFWHM() * self.getFWHM()))
-    
-        return pb
-
 
 def generate_gaussian_pb(
     freqs: u.Hz, aperture: u.m, offset: u.rad
@@ -262,22 +214,7 @@ def freqs_from_ms(ms_path: Path) -> np.ndarray:
     tf = table(f"{str(ms_path)}/SPECTRAL_WINDOW", ack=False)
     freqs = tf[0]["CHAN_FREQ"]
     tf.close()
-    return freqs
-
-def flux_nu(S1, alpha, nu1, nu2) -> float:
-    """Scale the flux S1 measured at frequency nu1 to nu2 assuming
-    a spectral index of alpha
-
-    Args:
-        S1 (float): The reference brightness
-        alpha (float): Assumed spectral index
-        nu1 (float): Reference frequency
-        nu2 (float): Frequency to scale to
-
-    Returns:
-        float: Brights at nu2
-    """
-    return S1 * np.power(nu2 / nu1, alpha)
+    return np.sort(freqs)
 
 def get_known_catalogue(cata: str) -> Catalogue:
     """Get the parameters of a known catalogue
@@ -373,9 +310,8 @@ def preprocess_catalogue(
     sky_pos = SkyCoord(
         cata_tab[cata_info.ra_col], cata_tab[cata_info.dec_col]
     )
-    sep_cut = radial_cut*u.deg
-    sep_mask = ms_pointing.separation(sky_pos) < sep_cut
-    logger.info(f"{np.sum(sep_mask)} sources within {sep_cut:.3f} DEG.")
+    sep_mask = ms_pointing.separation(sky_pos) < radial_cut
+    logger.info(f"{np.sum(sep_mask)} sources within {radial_cut.to(u.deg):.3f}.")
     
     mask = flux_mask & sep_mask
     logger.info(f"{np.sum(sep_mask)} common sources selected. ")
@@ -429,6 +365,58 @@ def make_ds9_region(out_path: Path, sources: List[Row]) -> Path:
         
     return out_path
         
+def make_hyperdrive_model(
+    out_path: Path, sources: List[Tuple[Row,CurvedPL]]
+) -> Path:
+    """Writes a Hyperdrive sky-model to a yaml file. 
+
+    Args:
+        out_path (Path): The output path that the sky-model would be written to
+        srcs (List[Tuple[Row,CurvedPL]]): Collection of sources to write, including the
+        normalied row and the results of fitting to the estimated apparent SED
+
+    Returns:
+        Path: The path of the file created
+    """
+    
+    src_list = {}
+    
+    for (row, cpl) in sources:
+        logger.debug(row)
+        
+        src_ra = float(row["RA"])
+        src_dec = float(row["DEC"])
+        comp_type = "point" if (row["maj"] < 1. and row["min"] < 1.) else {
+            "gaussian": {
+                "maj": float(row["maj"]),
+                "min": float(row["min"]),
+                "pa": float(row["pa"])
+            }
+        }
+        flux_type = {
+            "curved_power_law": {
+                "si": float(cpl.alpha),
+                "q": float(cpl.q),
+                "fd": {
+                    "freq": float(cpl.ref_nu),
+                    "i": float(cpl.norm)
+                }
+            }
+        }
+        
+        src_list[row["name"]] = [{
+            "ra": src_ra,
+            "dec": src_dec,
+            "comp_type": comp_type,
+            "flux_type": flux_type
+        }]
+            
+    with open(out_path, "w") as out_file:
+        logger.info(f"Writing {len(src_list)} components to {out_path}.")
+        yaml.dump(src_list, stream=out_file)
+    
+    return out_path
+
 def main(
     ms_path: Path, cata_dir: Path=Path("."), cata_name: Optional[str]=None, spectral_index: float=-0.83, flux_cutoff: float=0.02, fwhm_scale_cutoff: float=1
 ) -> Path:
@@ -455,12 +443,16 @@ def main(
     freqcent = np.mean(np.unique(freqs))
     f0 = freqs[0]
     fN = freqs[-1]
-    logger.info("Frequency range: %.3f MHz - %.3f MHz (centre = %.3f MHz)" %(f0 / 1.0e6, fN / 1.0e6, freqcent / 1.0e6))
+    logger.info(
+        f"Frequency range: {freqs[0]/1000.:.3f} MHz - {freqs[-1]/1000.:.3f} MHz (centre = {np.mean(freqs/1000.):.3f} MHz)"
+    )
     
-    pb = GaussianPB(frequency = freqcent) #, expscaling=1.09)
+    pb = generate_gaussian_pb(
+        freqs=freqs*u.Hz, aperture=12.*u.m, offset=0*u.rad
+    ) #, expscaling=1.09)
 
-    radial_cutoff = fwhm_scale_cutoff * np.degrees(pb.getFWHM()) # Go out just over 2 times the half-power point.
-    logger.info("Radial cutoff = %.3f degrees" %(radial_cutoff))
+    radial_cutoff = (fwhm_scale_cutoff * pb.fwhms[0]).decompose() # Go out just over 2 times the half-power point.
+    logger.info("Radial cutoff = %.3f degrees" %(radial_cutoff.to(u.deg).value))
 
     cata_info, cata_tab = load_catalogue(
         catalogue_dir=cata_dir,
@@ -475,69 +467,43 @@ def main(
 
     total_flux = 0.0
     # Will be used to generate ds9
-    accepted_rows: List[Row] = []
+    accepted_rows: List[Tuple(Row,CurvedPL)] = []
 
-    with open(model_path, 'wt') as fout:
-        logger.info(f"Writing header to {model_path}.")
-        fout.write("Format = Name, Type, Ra, Dec, I, SpectralIndex, LogarithmicSI, ReferenceFrequency='888500000.0', MajorAxis, MinorAxis, Orientation\n")
-        for i, row in enumerate(cata_tab):
-            src_pos = SkyCoord(row["RA"]*u.deg, row["DEC"]*u.deg)
-            src_sep = src_pos.separation(direction).radian
-            ra_str, dec_str = src_pos.to_string(style='hmsdms', sep=":").split()
-            
-            gauss_taper = generate_gaussian_pb(
-                freqs=freqs*u.Hz, aperture=12.0*u.m, offset=src_sep*u.rad
-            )
-            src_model = evaluate_src_model(
-                freqs=freqs, src_row=row, ref_nu=cata_info.freq
-            )
-            
-            predict_model = fit_curved_pl(
-                freqs=freqs,
-                flux=src_model*gauss_taper.atten/1000.,
-                ref_nu=freqcent
-            )
-            
-            # This is the AO Calibrate format
-            dec_str = dec_str.replace(":", ".")
-            
-            s_cat = row["flux"] / 1000. 
-            s_nu_low_int = s_cat * np.power(f0 / cata_info.freq, spectral_index)
-            s_nu_high_int = s_cat * np.power(fN / cata_info.freq, spectral_index)
-            
-            s_nu_low_app = s_nu_low_int * pb.evaluate(src_sep, freq=f0)
-            s_nu_high_app = s_nu_high_int * pb.evaluate(src_sep, freq=fN)
-            
-            if s_nu_low_app < flux_cutoff:
-                continue
-            
-            accepted_rows.append(row)
-            
-            alpha_app = np.log(s_nu_low_app / s_nu_high_app) / np.log(f0 / fN)
-            s_ref = flux_nu(s_nu_low_app, alpha_app, f0, freqcent)
+    for i, row in enumerate(cata_tab):
+        src_pos = SkyCoord(row["RA"]*u.deg, row["DEC"]*u.deg)
+        src_sep = src_pos.separation(direction)
+        
+        gauss_taper = generate_gaussian_pb(
+            freqs=freqs*u.Hz, aperture=12.0*u.m, offset=src_sep
+        )
+        src_model = evaluate_src_model(
+            freqs=freqs, src_row=row, ref_nu=cata_info.freq
+        )
+        predict_model = fit_curved_pl(
+            freqs=freqs,
+            flux=src_model*gauss_taper.atten/1000.,
+            ref_nu=freqs[0]
+        )
+                
+        if predict_model.norm < flux_cutoff:
+            continue
+        
+        accepted_rows.append((row,predict_model))
+        total_flux += predict_model.norm
+        
+        logger.info(f"{len(accepted_rows):05d} Sep={src_sep.to(u.deg):.3f} S_ref={predict_model.norm:.3f} SI={predict_model.alpha:.3f} q={predict_model.q:.3f}")
 
-            total_flux += (s_nu_low_app + s_nu_high_app) / 2.
-            logger.info(
-                f"{len(accepted_rows):05d} {row['name']} {s_cat=:.4f} S0={s_nu_low_int:.4f} {s_nu_low_app:.4f} SN={s_nu_high_int:.4f} {s_nu_high_app:.4f} {src_sep:.2f} deg Sref={s_ref:0.4f} alpha={alpha_app:.3f}"
-            )
-            
-            logger.info(
-                f"{predict_model}"
-            )
-            if row["maj"] < 1.0 and row["min"] < 1.0:
-                fout.write(
-                    f"s{i:05d},POINT,{ra_str},{dec_str},{s_ref},[{alpha_app},0.0],true,{freqcent},,,\n"
-                )
-            else:
-                fout.write(
-                    f"s{i:05d},GAUSS,{ra_str},{dec_str},{s_ref},[{alpha_app},0.0],true,{freqcent},{row['maj']},{row['min']},{row['pa']}\n"
-                )
+    logger.info(f"\nCreated model, total apparent flux = {total_flux:.4f} Jy, no. sources {len(accepted_rows)}.\n")
 
-    logger.info(f"Written {model_path}, total flux = {total_flux:.4f}, no. sources {len(accepted_rows)}. ")
+    hyperdrive_path = ms_path.with_suffix(".hyp.yaml")
+    make_hyperdrive_model(
+        out_path=hyperdrive_path, sources=accepted_rows
+    )
 
+    # TODO: Fix the sources kwarg
     region_path = ms_path.with_suffix(".model.reg")
     make_ds9_region(
-        out_path=region_path, sources=accepted_rows
+        out_path=region_path, sources=[r[0] for r in accepted_rows]
     )
 
     return model_path

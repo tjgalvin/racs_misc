@@ -41,8 +41,11 @@ def sex2deg2(str):
     else:
         return deg
 
-df = pd.read_csv(sys.argv[1])
+df = pd.read_csv(sys.argv[1],index_col=False)
 source_list = {}
+
+print(df)
+
 for i, row in df.iterrows():
     if row["Type"] == "GAUSS":
         comp_type = {
@@ -58,12 +61,13 @@ for i, row in df.iterrows():
         raise Exception(f'Unrecognised component type \'{row["Type"]}\'')
 
     flux_type = {
-        "power_law": {
-            #"si": row["SpectralIndex"],
-            "si": -0.83,
+        "curved_power_law": {
+            "si": row["SpectralIndex"],
+            "q": row["Curvature"],
+            # "si": -0.83,
             "fd": {
-                #"freq": row["ReferenceFrequency"],
-                "freq": 888500000.0,
+                "freq": row["ReferenceFrequency"],
+                # "freq": 888500000.0,
                 "i": row["I"],
             }
         }
