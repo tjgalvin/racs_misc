@@ -329,7 +329,7 @@ def preprocess_catalogue(
     ms_pointing: SkyCoord,
     flux_cut: float = 0.02,
     radial_cut: u.deg = 1.0 * u.deg,
-) -> Table:
+) -> QTable:
     """Apply the flux and separation cuts to a loaded table, and transform input column names to an
     expected set of column names.
 
@@ -341,7 +341,7 @@ def preprocess_catalogue(
         radial_cut (u.deg, optional): Radial separation cut in deg. Defaults to 1..
 
     Returns:
-        Table: _description_
+        QTable: _description_
     """
     # First apply pre-processing options
     flux_mask = cata_tab[cata_info.flux_col] > flux_cut
@@ -483,7 +483,7 @@ def main(
     assumed_q: float = 0.0,
     flux_cutoff: float = 0.02,
     fwhm_scale_cutoff: float = 1,
-) -> Path:
+) -> None:
     """Create a sky-model to calibrate RACS based measurement sets
 
     Args:
@@ -495,8 +495,6 @@ def main(
         flux_cutoff (float, optional): Sources whose *apparent* brightness (at the lowest channel of the MS) as excluded from sky-model. Defaults to 0.02.
         fwhm_scale_cutoff (float, optional): Scaling factor to stretch the analytical FWHM by when searching for sources. Defaults to 1.
 
-    Returns:
-        Path: Path to the model file created
     """
 
     assert ms_path.exists(), f"Measurement set {ms_path} does not exist. "
@@ -515,11 +513,11 @@ def main(
 
     radial_cutoff = (
         fwhm_scale_cutoff * pb.fwhms[0]
-    ).decompose()  # Go out just over 2 times the half-power point.
+    ).decompose()  # The lowest frequency FWHM is largest
     logger.info("Radial cutoff = %.3f degrees" % (radial_cutoff.to(u.deg).value))
 
     cata_info, cata_tab = load_catalogue(
-        catalogue_dir=cata_dir, catalogue=cata_name, ms_pointing=direction
+        catalogue_dir=cata_dir, catalogue=cata_name, ms_pointing=direction, assumed_alpha=assumed_alpha, assumed_q=assumed_q
     )
     cata_tab = preprocess_catalogue(
         cata_info,
@@ -528,8 +526,6 @@ def main(
         flux_cut=flux_cutoff,
         radial_cut=radial_cutoff,
     )
-
-    model_path = ms_path.with_suffix(".model")
 
     total_flux: u.Jy = 0.0 * u.Jy
     accepted_rows: List[Tuple[Row, CurvedPL]] = []
@@ -575,7 +571,8 @@ def main(
     region_path = ms_path.with_suffix(".model.reg")
     make_ds9_region(out_path=region_path, sources=[r[0] for r in accepted_rows])
 
-    return model_path
+    # TODO: What to return? Total flux/no sources? Path to models created?
+    return 
 
 
 def get_parser():
