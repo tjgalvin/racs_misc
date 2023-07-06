@@ -38,6 +38,14 @@ class Catalogue(NamedTuple):
 
 
 class CurvedPL(NamedTuple):
+    """Container for results of a Curved Power Law,
+    
+    >>> S_nu = S_nu_0 * (nu/nu_0)**alpha * exp(q*ln(nu/nu_0)**2.)
+
+    Note that in the case of q=0. the model reduces to a normal power-law.
+
+    """
+    # TODO: Should these be quantities?
     norm: float
     alpha: float
     q: float
@@ -261,8 +269,8 @@ def load_catalogue(
     catalogue_dir: Path,
     catalogue: Optional[str] = None,
     ms_pointing: Optional[SkyCoord] = None,
-    assumed_alpha: float=-0.83,
-    assumed_q: float=0.0
+    assumed_alpha: float = -0.83,
+    assumed_q: float = 0.0,
 ) -> Tuple[Catalogue, Table]:
     """Load in a catalogue table given a name or measurement set declinattion.
 
@@ -272,7 +280,7 @@ def load_catalogue(
         ms_pointing (Optional[SkyCoord], optional): Pointing direction of the measurement set. Defaults to None.
         assumed_alpha (float, optional): The assumed spectral index to use if there is no spectral index column known in model catalogue. Defaults to -0.83.
         assumed_q (float, optional): The assumed curvature to use if there is no curvature column known in model catalogue. Defaults to 0.0.
-        
+
     Raises:
         FileNotFoundError: Raised when a catalogue can not be resolved.
 
@@ -310,7 +318,9 @@ def load_catalogue(
 
     _cols = cata._asdict()
     if cata.alpha_col is None:
-        logger.info(f"No 'alpha' column, adding default spectral index of {assumed_alpha:.3f}. ")
+        logger.info(
+            f"No 'alpha' column, adding default spectral index of {assumed_alpha:.3f}. "
+        )
         cata_tab["alpha"] = assumed_alpha
         _cols["alpha_col"] = "alpha"
     if cata.q_col is None:
@@ -475,6 +485,67 @@ def make_hyperdrive_model(out_path: Path, sources: List[Tuple[Row, CurvedPL]]) -
     return out_path
 
 
+def make_calibrate_model(out_path: Path, sources: List[Tuple[Row, CurvedPL]]) -> Path:
+    """Create a sky-model file that is compatible with the AO Calibrate software
+
+    Args:
+        out_path (Path): Output path of the model file
+        sources (List[Tuple[Row,CurvedPL]]): The sources and their (apparent) SED to write
+
+    Returns:
+        Path: Output path of the model file
+    """
+    logger.info(
+        f"Creating AO calibrate sky-model, witing {len(sources)} components to {out_path}."
+    )
+
+    ref_nu = sources[0][1].ref_nu
+    with open(out_path, "w") as out_file:
+        out_file.write(
+            f"Format = Name, Type, Ra, Dec, I, SpectralIndex, LogarithmicSI, ReferenceFrequency='{ref_nu}', MajorAxis, MinorAxis, Orientation\n"
+        )
+
+        for src_row, src_cpl in sources:
+            pos = SkyCoord(src_row["RA"], src_row["DEC"])
+            ra_dec = pos.to_string(style="hmsdms", sep=":").split()
+            ra_str = ra_dec[0]
+            # The AO dec string format is '.' delimited, even for the seconds.
+            dec_str = ra_dec[1].replace(":", ".")
+
+            if (
+                src_row["maj"] < 1.0 * u.arcsecond
+                and src_row["min"] < 1.0 * u.arcsecond
+            ):
+                out_file.write(
+                    (
+                        f"{src_row['name']},"
+                        f"POINT,"
+                        f"{ra_str},"
+                        f"{dec_str},"
+                        f"{src_cpl.norm},"
+                        f"[{src_cpl.alpha},{src_cpl.q}],"
+                        f"true,{ref_nu},,,\n"
+                    )
+                )
+            else:
+                out_file.write(
+                    (
+                        f"{src_row['name']},"
+                        f"GAUSSIAN,"
+                        f"{ra_str},"
+                        f"{dec_str},"
+                        f"{src_cpl.norm},"
+                        f"[{src_cpl.alpha},{src_cpl.q}],"
+                        f"true,{ref_nu},"
+                        f"{src_row['maj'].to(u.arcsecond).value},"
+                        f"{src_row['maj'].to(u.arcsecond).value},"
+                        f"{src_row['pa'].to(u.deg).value},\n"
+                    )
+                )
+
+    return out_path
+
+
 def main(
     ms_path: Path,
     cata_dir: Path = Path("."),
@@ -517,7 +588,11 @@ def main(
     logger.info("Radial cutoff = %.3f degrees" % (radial_cutoff.to(u.deg).value))
 
     cata_info, cata_tab = load_catalogue(
-        catalogue_dir=cata_dir, catalogue=cata_name, ms_pointing=direction, assumed_alpha=assumed_alpha, assumed_q=assumed_q
+        catalogue_dir=cata_dir,
+        catalogue=cata_name,
+        ms_pointing=direction,
+        assumed_alpha=assumed_alpha,
+        assumed_q=assumed_q,
     )
     cata_tab = preprocess_catalogue(
         cata_info,
@@ -538,12 +613,12 @@ def main(
         gauss_taper = generate_gaussian_pb(
             freqs=freqs, aperture=12.0 * u.m, offset=src_sep
         )
-        
+
         # Calculate the expected model
         src_model = evaluate_src_model(
             freqs=freqs, src_row=row, ref_nu=cata_info.freq * u.Hz
         )
-        
+
         # Estimate the apparent model (intrinsic*response), and
         # then numerically fit to it
         predict_model = fit_curved_pl(
@@ -567,12 +642,15 @@ def main(
     hyperdrive_path = ms_path.with_suffix(".hyp.yaml")
     make_hyperdrive_model(out_path=hyperdrive_path, sources=accepted_rows)
 
+    calibrate_path = ms_path.with_suffix(".calibrate.txt")
+    make_calibrate_model(out_path=calibrate_path, sources=accepted_rows)
+
     # TODO: Fix the sources kwarg
     region_path = ms_path.with_suffix(".model.reg")
     make_ds9_region(out_path=region_path, sources=[r[0] for r in accepted_rows])
 
     # TODO: What to return? Total flux/no sources? Path to models created?
-    return 
+    return
 
 
 def get_parser():
@@ -584,10 +662,16 @@ def get_parser():
         "ms", type=Path, help="Path to the measurement set to create the sky-model for"
     )
     parser.add_argument(
-        "--assumed-alpha", type=float, default=-0.83, help="Assumed spectral index when no appropriate column in sky-catalogue. "
+        "--assumed-alpha",
+        type=float,
+        default=-0.83,
+        help="Assumed spectral index when no appropriate column in sky-catalogue. ",
     )
     parser.add_argument(
-        "--assumed-q", type=float, default=0.0, help="Assumed curvature when no apropriate column in sky-catalogue. "
+        "--assumed-q",
+        type=float,
+        default=0.0,
+        help="Assumed curvature when no apropriate column in sky-catalogue. ",
     )
     parser.add_argument(
         "--fwhm-scale",
@@ -631,5 +715,5 @@ if __name__ == "__main__":
         flux_cutoff=args.flux_cutoff,
         fwhm_scale_cutoff=args.fwhm_scale,
         assumed_alpha=args.assumed_alpha,
-        assumed_q=args.assumed_q
+        assumed_q=args.assumed_q,
     )
