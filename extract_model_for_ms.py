@@ -39,12 +39,13 @@ class Catalogue(NamedTuple):
 
 class CurvedPL(NamedTuple):
     """Container for results of a Curved Power Law,
-    
+
     >>> S_nu = S_nu_0 * (nu/nu_0)**alpha * exp(q*ln(nu/nu_0)**2.)
 
     Note that in the case of q=0. the model reduces to a normal power-law.
 
     """
+
     # TODO: Should these be quantities?
     norm: float
     alpha: float
@@ -57,6 +58,15 @@ class GaussianTaper(NamedTuple):
     atten: np.ndarray  # The attenuation of the response
     fwhms: np.ndarray  # The full-width at half-maximum corresponding to freqs
     offset: float  # Angular offset of the source
+
+
+class SkyModel(NamedTuple):
+    flux_jy: float
+    no_sources: int
+    apparent: bool = True
+    hyperdrive_model: Optional[Path] = None
+    calibrate_model: Optional[Path] = None
+    ds9_region: Optional[Path] = None
 
 
 # These columns are what we will normalise the all columns and units to
@@ -133,6 +143,10 @@ def curved_power_law(
     nu: np.ndarray, norm: float, alpha: float, beta: float, ref_nu: float
 ) -> np.ndarray:
     """A curved power law model.
+
+    >>> S_nu = S_nu_0 * (nu/nu_0)**alpha * exp(q*ln(nu/nu_0)**2.)
+
+    Note that in the case of q=0. the model reduces to a normal power-law.
 
     Args:
         nu (np.ndarray): Frequency array.
@@ -546,7 +560,7 @@ def make_calibrate_model(out_path: Path, sources: List[Tuple[Row, CurvedPL]]) ->
     return out_path
 
 
-def main(
+def create_sky_model(
     ms_path: Path,
     cata_dir: Path = Path("."),
     cata_name: Optional[str] = None,
@@ -554,7 +568,10 @@ def main(
     assumed_q: float = 0.0,
     flux_cutoff: float = 0.02,
     fwhm_scale_cutoff: float = 1,
-) -> None:
+    hyperdrive_model: bool = True,
+    calibrate_model: bool = True,
+    ds9_region: bool = True,
+) -> SkyModel:
     """Create a sky-model to calibrate RACS based measurement sets
 
     Args:
@@ -565,7 +582,12 @@ def main(
         assumed_q (float, optional): The assumed curvature to use if there is no curvature column known in model catalogue. Defaults to 0.0.
         flux_cutoff (float, optional): Sources whose *apparent* brightness (at the lowest channel of the MS) as excluded from sky-model. Defaults to 0.02.
         fwhm_scale_cutoff (float, optional): Scaling factor to stretch the analytical FWHM by when searching for sources. Defaults to 1.
+        hyperdrive_model (bool, optional): Create a hyperdrive model using the suffix 'hyp.yaml'. Defaults to True.
+        hyperdrive_model (bool, optional): Create a calibrate model using the suffix 'calibrate.txt'. Defaults to True.
+        hyperdrive_model (bool, optional): Create a DS9 region file highlight the sources in the model using the suffix 'model.reg'. Defaults to True.
 
+    Returns:
+        SkyModel -- Basic informattion concerning the sky-model derived and the output files
     """
 
     assert ms_path.exists(), f"Measurement set {ms_path} does not exist. "
@@ -580,6 +602,7 @@ def main(
         f"Frequency range: {freqs[0]/1000.:.3f} MHz - {freqs[-1]/1000.:.3f} MHz (centre = {np.mean(freqs/1000.):.3f} MHz)"
     )
 
+    # This is used to estimate a frequency-dependent search radius
     pb = generate_gaussian_pb(freqs=freqs, aperture=12.0 * u.m, offset=0 * u.rad)
 
     radial_cutoff = (
@@ -640,17 +663,29 @@ def main(
     )
 
     hyperdrive_path = ms_path.with_suffix(".hyp.yaml")
-    make_hyperdrive_model(out_path=hyperdrive_path, sources=accepted_rows)
-
     calibrate_path = ms_path.with_suffix(".calibrate.txt")
-    make_calibrate_model(out_path=calibrate_path, sources=accepted_rows)
-
-    # TODO: Fix the sources kwarg
     region_path = ms_path.with_suffix(".model.reg")
-    make_ds9_region(out_path=region_path, sources=[r[0] for r in accepted_rows])
 
     # TODO: What to return? Total flux/no sources? Path to models created?
-    return
+    return SkyModel(
+        flux_jy=total_flux.to(u.Jy).value,
+        no_sources=len(accepted_rows),
+        hyperdrive_model=make_hyperdrive_model(
+            out_path=hyperdrive_path, sources=accepted_rows
+        )
+        if hyperdrive_model
+        else None,
+        calibrate_model=make_calibrate_model(
+            out_path=calibrate_path, sources=accepted_rows
+        )
+        if calibrate_model
+        else None,
+        ds9_region=make_ds9_region(
+            out_path=region_path, sources=[r[0] for r in accepted_rows]
+        )
+        if ds9_region
+        else None,
+    )
 
 
 def get_parser():
@@ -701,14 +736,14 @@ def get_parser():
     return parser
 
 
-if __name__ == "__main__":
+def cli() -> None:
     parser = get_parser()
 
     args = parser.parse_args()
 
     logger.setLevel(logging.INFO)
 
-    main(
+    create_sky_model(
         ms_path=args.ms,
         cata_dir=args.cata_dir,
         cata_name=args.cata_name,
@@ -717,3 +752,7 @@ if __name__ == "__main__":
         assumed_alpha=args.assumed_alpha,
         assumed_q=args.assumed_q,
     )
+
+
+if __name__ == "__main__":
+    cli()
